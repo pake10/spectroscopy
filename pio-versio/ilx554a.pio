@@ -1,0 +1,63 @@
+.program ilx554a
+.side_set 1
+
+; Pin mapping:
+;   SIDE-SET pin 0 = GP2 (phi_CLK, pixels shift on falling edge)
+;   SET pin 0      = GP3 (phi_ROG, active LOW readout gate)
+; PIO clock = 2.0 MHz (0.5 us per instruction cycle)
+
+.wrap_target
+    ; 1. Integration / Flush Phase
+    ; Clock phi_CLK while phi_ROG is HIGH to flush dark charge during integration
+    pull block          side 1      ; Pull flush clock count from TX FIFO
+    mov x, osr          side 1      ; X = number of 4.0 us flush cycles
+flush_loop:
+    nop                 side 0 [3]  ; CLK LOW for 2.0 us
+    jmp x-- flush_loop  side 1 [3]  ; CLK HIGH for 2.0 us
+
+    ; 2. Readout Gate (phi_ROG) Pulse Sequence
+    nop                 side 1 [3]  ; Hold CLK HIGH for 2.0 us before ROG falls (t1 >= 1 us)
+    set pins, 0         side 1 [7]  ; Assert ROG LOW for 4.0 us (tw_ROG >= 2 us)
+    set pins, 1         side 1 [3]  ; Release ROG HIGH, wait 2.0 us with CLK HIGH (t2 >= 1 us)
+
+    ; 3. 2090-Pixel Readout & Phase-Locked ADC Trigger Loop
+    pull block          side 1      ; Pull (NUM_PIXELS - 1) = 2089 from TX FIFO
+    mov y, osr          side 1      ; Y = 2089
+    set x, 4            side 1      ; X = 0x04 (ADC_CS_START_ONCE_BITS)
+
+pixel_loop:
+    nop                 side 0 [1]  ; CLK falls -> pixel shifts out; wait 1.0 us to settle
+    in x, 32            side 0 [1]  ; Autopush 0x04 to RX FIFO (triggers ADC DMA); hold 1.0 us
+    jmp y-- pixel_loop  side 1 [3]  ; CLK HIGH for 2.0 us while ADC converts & DMA reads
+.wrap
+
+% c-sdk {
+#include "hardware/clocks.h"
+
+static inline void ilx554a_program_init(PIO pio, uint sm, uint offset, uint clk_pin, uint rog_pin) {
+    pio_sm_config c = ilx554a_program_get_default_config(offset);
+
+    // Map side-set to phi_CLK and SET to phi_ROG
+    sm_config_set_sideset_pins(&c, clk_pin);
+    sm_config_set_set_pins(&c, rog_pin, 1);
+
+    pio_gpio_init(pio, clk_pin);
+    pio_gpio_init(pio, rog_pin);
+
+    // Initialize both pins HIGH (idle state)
+    pio_sm_set_pins_with_mask(pio, sm, (1u << clk_pin) | (1u << rog_pin),
+                              (1u << clk_pin) | (1u << rog_pin));
+    pio_sm_set_pindirs_with_mask(pio, sm, (1u << clk_pin) | (1u << rog_pin),
+                                 (1u << clk_pin) | (1u << rog_pin));
+
+    // Autopush 32-bit trigger word into RX FIFO on `in x, 32`
+    sm_config_set_in_shift(&c, false, true, 32);
+
+    // Run PIO at 2.0 MHz (0.5 us per tick)
+    float div = (float)clock_get_hz(clk_sys) / 1000000.0f; // (float)clock_get_hz(clk_sys) / 2000000.0f;
+    sm_config_set_clkdiv(&c, div);
+
+    pio_sm_init(pio, sm, offset, &c);
+    pio_sm_set_enabled(pio, sm, true);
+}
+%}
